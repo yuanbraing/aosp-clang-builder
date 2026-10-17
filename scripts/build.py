@@ -47,6 +47,8 @@ void _start(void) {
     for (;;) {}
 }
 """
+# Clang 11 predates KCFI; use the classic LTO CFI (icall) instrumentation.
+CFI_FLAGS = ["-flto=thin", "-fsanitize=cfi-icall", "-fsanitize-trap=cfi", "-fvisibility=hidden"]
 
 
 class BuildError(RuntimeError):
@@ -491,11 +493,12 @@ def verify(args, work):
             raise BuildError(f"Cross compilation for {backend} produced the wrong architecture.")
         run([prefix / "bin/ld.lld", "-r", output, "-o", checks / f"{backend}-linked.o"])
     if "AArch64" in metadata["targets"]:
-        bitcode = checks / "kcfi.o"
-        run([prefix / "bin/clang", "--target=aarch64-linux-gnu", "-O2", "-ffreestanding", "-fno-stack-protector", "-flto=thin", "-fsanitize=kcfi", "-c", sample, "-o", bitcode])
-        run([prefix / "bin/ld.lld", "-e", "_start", bitcode, "-o", checks / "kcfi.elf"])
-        if elf_machine(checks / "kcfi.elf") != 183:
-            raise BuildError("ThinLTO/KCFI linking failed.")
+        bitcode = checks / "cfi.o"
+        run([prefix / "bin/clang", "--target=aarch64-linux-gnu", "-O2", "-ffreestanding",
+             "-fno-stack-protector", *CFI_FLAGS, "-c", sample, "-o", bitcode])
+        run([prefix / "bin/ld.lld", "-e", "_start", bitcode, "-o", checks / "cfi.elf"])
+        if elf_machine(checks / "cfi.elf") != 183:
+            raise BuildError("ThinLTO/CFI linking failed.")
     if "BPF" in metadata["targets"]:
         bpf_source = checks / "bpf.c"
         bpf_source.write_text("int probe(void *ctx) { return ctx != 0; }\n")
@@ -505,7 +508,7 @@ def verify(args, work):
     metadata.update({
         "clang_version": actual_version.group(1),
         "minimum_glibc": max(glibc_versions, key=lambda x: tuple(map(int, x.split(".")))) if glibc_versions else None,
-        "verification": "native ELF, dynamic dependencies, selected cross targets, AArch64 ThinLTO/KCFI when enabled",
+        "verification": "native ELF, dynamic dependencies, selected cross targets, AArch64 ThinLTO/CFI (icall) when enabled",
     })
     save_metadata(work, metadata)
     (prefix / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -522,9 +525,9 @@ def compatibility(args, work):
     if "AArch64" in metadata["targets"]:
         command += (
             "; /toolchain/bin/clang --target=aarch64-linux-gnu -O2 -ffreestanding "
-            "-fno-stack-protector -flto=thin -fsanitize=kcfi -c "
-            "/toolchain/validation/kernel-smoke.c -o /tmp/kcfi.o"
-            "; /toolchain/bin/ld.lld -e _start /tmp/kcfi.o -o /tmp/kcfi.elf"
+            "-fno-stack-protector -flto=thin -fsanitize=cfi-icall -fsanitize-trap=cfi "
+            "-fvisibility=hidden -c /toolchain/validation/kernel-smoke.c -o /tmp/cfi.o"
+            "; /toolchain/bin/ld.lld -e _start /tmp/cfi.o -o /tmp/cfi.elf"
         )
     run(["docker", "run", "--rm", "--platform", docker_platform, "--volume", f"{prefix}:/toolchain:ro", "ubuntu:24.04", "bash", "-euc", command])
     metadata["ubuntu_24_04_compatibility"] = "passed in a native stock Docker image"
@@ -580,7 +583,7 @@ def relocation(args, work):
             if backend not in metadata["targets"]:
                 continue
             linked = relocation_root / "smoke.elf"
-            flags = ["-flto=thin", "-fsanitize=kcfi"] if backend == "AArch64" else []
+            flags = CFI_FLAGS if backend == "AArch64" else []
             command = [
                 compiler, f"--target={triple}", "-O2", "-ffreestanding", "-fno-stack-protector",
                 "-nostdlib", "-fuse-ld=lld", "-Wl,-e,_start", *flags, sample, "-o", linked,
