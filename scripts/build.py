@@ -407,7 +407,7 @@ def build(args, work):
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
         # Official prebuilts enable LTO for the final stage.
-        "-DLLVM_ENABLE_LTO=Thin",
+   #      "-DLLVM_ENABLE_LTO=Thin",
         # Match AOSP's vendor string format.
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
