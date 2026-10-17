@@ -390,8 +390,6 @@ def build(args, work):
         f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_CXX_COMPILER={cxx}",
         f"-DLLVM_USE_LINKER={linker}",
-        # Match official prebuilt: use LLD for linking the toolchain itself.
-        "-DLLVM_ENABLE_LLD=ON",
         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
         f"-DLLVM_ENABLE_PROJECTS={';'.join(projects)}",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
