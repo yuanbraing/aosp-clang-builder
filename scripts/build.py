@@ -439,10 +439,7 @@ def build(args, work):
     for license_file in (work / "sources/toolchain").glob("MODULE_LICENSE_*"):
         shutil.copyfile(license_file, notices / license_file.name)
     shutil.copyfile(work / "sources/toolchain/patches/PATCHES.json", prefix / "PATCHES.json")
-    # Clang 11 CFI needs an implicit blacklist file to exist.
-    share_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
-    share_dir.mkdir(parents=True, exist_ok=True)
-    (share_dir / "cfi_blacklist.txt").touch()
+
 
 
 def elf_machine(path):
@@ -454,6 +451,10 @@ def elf_machine(path):
 
 
 def verify(args, work):
+    # Clang 11 CFI needs an implicit blacklist file to exist.
+    share_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
+    share_dir.mkdir(parents=True, exist_ok=True)
+    (share_dir / "cfi_blacklist.txt").touch()
     metadata = load_metadata(work)
     prefix = Path(metadata["install_prefix"])
     machine = {"aarch64": 183, "x86_64": 62}[native_architecture()]
