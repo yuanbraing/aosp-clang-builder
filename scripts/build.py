@@ -92,9 +92,10 @@ def version_constants(path):
         for name in names:
             if isinstance(name, ast.Name):
                 values[name.id] = value
-    for key in ("_svn_revision", "_git_sha"):
-        if not isinstance(values.get(key), str):
-            raise BuildError(f"{path}: unsupported version metadata: {key}")
+    if not isinstance(values.get("_svn_revision"), str):
+        raise BuildError(f"{path}: unsupported version metadata: _svn_revision")
+    if "_git_sha" in values and not isinstance(values["_git_sha"], str):
+        raise BuildError(f"{path}: unsupported version metadata: _git_sha")
     return values
 
 
@@ -247,13 +248,22 @@ def prepare(args, work):
         raise BuildError("Cannot find AOSP android_version.py in this revision.")
     version = version_constants(version_file)
     resolved_revision = effective_revision(revision, version["_svn_revision"])
-    llvm_sha = resolve_ref(LLVM_REPO, args.llvm_ref or version["_git_sha"])
+    llvm_base = args.llvm_ref or version.get("_git_sha")
+    if not llvm_base:
+        raise BuildError(
+            "This toolchain revision does not pin an LLVM base; pass --llvm-ref."
+        )
+    llvm_sha = resolve_ref(LLVM_REPO, llvm_base)
     llvm = work / "sources" / "llvm-project"
     source_archive(LLVM_REPO, llvm_sha, llvm, work / "downloads")
     patch_index = toolchain / "patches/PATCHES.json"
     if not patch_index.is_file():
         raise BuildError("This toolchain revision has no patches/PATCHES.json.")
-    patches = select_patches(json.loads(patch_index.read_text()), number)
+    patch_data = json.loads(patch_index.read_text())
+    # Older toolchain revisions wrap the list in a "patches" key.
+    if isinstance(patch_data, dict):
+        patch_data = patch_data.get("patches", [])
+    patches = select_patches(patch_data, number)
     # Never skip a failed patch and label the result as this AOSP version.
     applied = apply_patchset(llvm, toolchain / "patches", patches)
     patch_level = version.get("_patch_level")
@@ -267,8 +277,8 @@ def prepare(args, work):
         "toolchain_commit": patch_sha,
         "llvm_repository": f"https://github.com/{LLVM_REPO}",
         "llvm_commit": llvm_sha,
-        "aosp_llvm_commit": version["_git_sha"],
-        "custom_llvm_base": llvm_sha != version["_git_sha"],
+        "aosp_llvm_commit": version.get("_git_sha"),
+        "custom_llvm_base": llvm_sha != version.get("_git_sha"),
         "aosp_patch_level": patch_level,
         "patch_application": "AOSP GNU patch: -f -E -p1 --no-backup-if-mismatch",
         "patches": applied,
