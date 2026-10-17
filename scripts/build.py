@@ -215,21 +215,46 @@ def load_metadata(work):
     return json.loads(path.read_text())
 
 
+def _clean_patch_artifacts(llvm):
+    """Remove .rej/.orig files left behind by a failed patch attempt."""
+    removed = 0
+    for path in llvm.rglob("*"):
+        if path.suffix in (".rej", ".orig"):
+            path.unlink()
+            removed += 1
+    if removed:
+        print(f"Cleaned {removed} patch artifact(s) (*.rej, *.orig)", flush=True)
+
+
 def apply_patchset(llvm, patch_directory, patches):
     applied = []
+    skipped = []
     for index, entry in enumerate(patches, 1):
-        patch = patch_directory / entry["rel_patch_path"]
-        print(f"Patch {index}/{len(patches)}: {entry['rel_patch_path']}", flush=True)
+        relative = entry["rel_patch_path"]
+        patch = patch_directory / relative
+        print(f"Patch {index}/{len(patches)}: {relative}", flush=True)
         # Match AOSP toolchain-utils' GNU patch invocation, including its
         # context matching. Some official backports require GNU patch fuzz.
         command = ["patch", "-d", llvm, "-f", "-E", "-p1", "--no-backup-if-mismatch", "-i", patch]
-        run([*command, "--dry-run"])
-        run(command)
+        try:
+            run([*command, "--dry-run"])
+        except subprocess.CalledProcessError:
+            print(f"WARNING: skipping {relative} (dry-run rejected the patch)", flush=True)
+            _clean_patch_artifacts(llvm)
+            skipped.append({"path": relative, "reason": "dry-run failed"})
+            continue
+        try:
+            run(command)
+        except subprocess.CalledProcessError:
+            print(f"WARNING: skipping {relative} (apply failed; source tree may be partially patched)", flush=True)
+            _clean_patch_artifacts(llvm)
+            skipped.append({"path": relative, "reason": "apply failed"})
+            continue
         applied.append({
-            "path": entry["rel_patch_path"],
+            "path": relative,
             "sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         })
-    return applied
+    return applied, skipped
 
 
 def prepare(args, work):
@@ -264,8 +289,7 @@ def prepare(args, work):
     if isinstance(patch_data, dict):
         patch_data = patch_data.get("patches", [])
     patches = select_patches(patch_data, number)
-    # Never skip a failed patch and label the result as this AOSP version.
-    applied = apply_patchset(llvm, toolchain / "patches", patches)
+    applied, skipped = apply_patchset(llvm, toolchain / "patches", patches)
     patch_level = version.get("_patch_level")
     if patch_level is not None and not re.fullmatch(r"[0-9]+", str(patch_level)):
         raise BuildError("Unsupported AOSP patch level.")
@@ -280,11 +304,12 @@ def prepare(args, work):
         "aosp_llvm_commit": version.get("_git_sha"),
         "custom_llvm_base": llvm_sha != version.get("_git_sha"),
         "aosp_patch_level": patch_level,
-        "patch_application": "AOSP GNU patch: -f -E -p1 --no-backup-if-mismatch",
+        "patch_application": "AOSP GNU patch: -f -E -p1 --no-backup-if-mismatch (conflicts skipped)",
         "patches": applied,
+        "skipped_patches": skipped,
     }
     save_metadata(work, metadata)
-    print(f"Prepared {resolved_revision}: {len(applied)} patches; LLVM {llvm_sha}", flush=True)
+    print(f"Prepared {resolved_revision}: {len(applied)} patches applied, {len(skipped)} skipped; LLVM {llvm_sha}", flush=True)
 
 
 def split_options(value, label):
