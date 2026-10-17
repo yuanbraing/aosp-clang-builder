@@ -53,6 +53,14 @@ class BuildError(RuntimeError):
     pass
 
 
+class PatchResult(list):
+    """List of applied patches, with skipped patches attached as .skipped."""
+
+    def __init__(self, applied, skipped):
+        super().__init__(applied)
+        self.skipped = skipped
+
+
 def run(command, *, cwd=None, capture=False, display=True, env=None):
     print("+ " + shlex.join(str(x) for x in command), flush=True)
     result = subprocess.run(
@@ -254,7 +262,7 @@ def apply_patchset(llvm, patch_directory, patches):
             "path": relative,
             "sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         })
-    return applied, skipped
+    return PatchResult(applied, skipped)
 
 
 def prepare(args, work):
@@ -289,7 +297,8 @@ def prepare(args, work):
     if isinstance(patch_data, dict):
         patch_data = patch_data.get("patches", [])
     patches = select_patches(patch_data, number)
-    applied, skipped = apply_patchset(llvm, toolchain / "patches", patches)
+    result = apply_patchset(llvm, toolchain / "patches", patches)
+    applied, skipped = list(result), result.skipped
     patch_level = version.get("_patch_level")
     if patch_level is not None and not re.fullmatch(r"[0-9]+", str(patch_level)):
         raise BuildError("Unsupported AOSP patch level.")
