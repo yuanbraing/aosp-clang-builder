@@ -398,6 +398,8 @@ def build(args, work):
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
         f"-DCLANG_VENDOR=AOSP {metadata['clang_revision']} (native {architecture} rebuild) ",
+        "-DLLVM_ENABLE_Z3_SOLVER=OFF",
+        "-DCLANG_ANALYZER_BUILD_Z3=OFF",
     ]
     if metadata["aosp_patch_level"] is not None:
         options.append(f"-DLLVM_VERSION_PATCH={metadata['aosp_patch_level']}")
@@ -439,6 +441,9 @@ def build(args, work):
     for license_file in (work / "sources/toolchain").glob("MODULE_LICENSE_*"):
         shutil.copyfile(license_file, notices / license_file.name)
     shutil.copyfile(work / "sources/toolchain/patches/PATCHES.json", prefix / "PATCHES.json")
+    # Clang 11 CFI needs an implicit blacklist file to exist.
+    share_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
+    share_dir.mkdir(parents=True, exist_ok=True)
 
 
 
@@ -451,9 +456,6 @@ def elf_machine(path):
 
 
 def verify(args, work):
-    # Clang 11 CFI needs an implicit blacklist file to exist.
-    share_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
-    share_dir.mkdir(parents=True, exist_ok=True)
     (share_dir / "cfi_blacklist.txt").touch()
     metadata = load_metadata(work)
     prefix = Path(metadata["install_prefix"])
