@@ -264,30 +264,37 @@ def apply_patchset(llvm, patch_directory, patches):
 def patch_runtimes_utils(llvm):
     """Replace $<TARGET_FILE:llvm-ranlib/llvm-strip> with real host tool paths.
 
-    LLVM 11's runtimes integration references these generator expressions, but
-    llvm-ranlib and llvm-strip are symlink targets (add_llvm_tool_symlink), so
-    $<TARGET_FILE:...> cannot be evaluated. Swap in the host tool paths.
+    llvm-ranlib and llvm-strip are add_llvm_tool_symlink targets, so
+    $<TARGET_FILE:...> cannot be evaluated. This substitution is idempotent
+    and covers every CMake file that may reference those expressions.
     """
-    utils = llvm / "llvm/cmake/modules/LLVMExternalProjectUtils.cmake"
-    if not utils.is_file():
-        print("WARNING: LLVMExternalProjectUtils.cmake not found; skipping runtimes patch.", flush=True)
-        return
     ranlib = shutil.which("llvm-ranlib-15") or shutil.which("llvm-ranlib") or shutil.which("ranlib")
     strip = shutil.which("llvm-strip-15") or shutil.which("llvm-strip") or shutil.which("strip")
-    text = utils.read_text()
-    changed = False
-    for old, new in (
-        ("$<TARGET_FILE:llvm-ranlib>", ranlib or ""),
-        ("$<TARGET_FILE:llvm-strip>", strip or ""),
+    if not ranlib or not strip:
+        print("WARNING: cannot find host ranlib/strip; runtimes patch skipped.", flush=True)
+        return
+    changed = []
+    for relative in (
+        "llvm/cmake/modules/LLVMExternalProjectUtils.cmake",
+        "runtimes/CMakeLists.txt",
+        "runtimes/builtins/CMakeLists.txt",
+        "compiler-rt/cmake/Modules/AddCompilerRT.cmake",
     ):
-        if old in text and new:
-            text = text.replace(old, new)
-            changed = True
+        path = llvm / relative
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        new_text = (text
+                    .replace("$<TARGET_FILE:llvm-ranlib>", ranlib)
+                    .replace("$<TARGET_FILE:llvm-strip>", strip))
+        if new_text != text:
+            path.write_text(new_text)
+            changed.append(relative)
     if changed:
-        utils.write_text(text)
-        print(f"Patched runtimes tool paths: ranlib={ranlib}, strip={strip}", flush=True)
+        print(f"Patched runtimes tool paths in: {', '.join(changed)}", flush=True)
+        print(f"  ranlib={ranlib}, strip={strip}", flush=True)
     else:
-        print("WARNING: runtimes patch made no changes; LLVM 11 may need manual fix.", flush=True)
+        print("WARNING: runtimes patch made no changes; source may already be patched.", flush=True)
 
 
 def prepare(args, work):
@@ -321,7 +328,6 @@ def prepare(args, work):
     patches = select_patches(patch_data, number)
     result = apply_patchset(llvm, toolchain / "patches", patches)
     applied, skipped = list(result), result.skipped
-    patch_runtimes_utils(llvm)
     patch_level = version.get("_patch_level")
     if patch_level is not None and not re.fullmatch(r"[0-9]+", str(patch_level)):
         raise BuildError("Unsupported AOSP patch level.")
@@ -337,7 +343,6 @@ def prepare(args, work):
         "custom_llvm_base": llvm_sha != version.get("_git_sha"),
         "aosp_patch_level": patch_level,
         "patch_application": "AOSP GNU patch: -f -E -p1 --no-backup-if-mismatch (conflicts skipped)",
-        "runtimes_utils_patched": True,
         "patches": applied,
         "skipped_patches": skipped,
     }
@@ -394,6 +399,9 @@ def build(args, work):
         raise BuildError("--jobs must be zero (automatic) or a positive number.")
     jobs = args.jobs or automatic_jobs()
     prefix = work / "install" / f"clang-{metadata['clang_revision']}"
+    llvm = work / "sources" / "llvm-project"
+    # Apply the runtimes tool-path patch every build; idempotent.
+    patch_runtimes_utils(llvm)
     compiler, cxx = compiler_pair()
     linker = next((shutil.which(name) for name in ("ld.lld-22", "ld.lld-21", "ld.lld-20", "ld.lld-19", "ld.lld-18", "ld.lld-17", "ld.lld-16", "ld.lld-15", "ld.lld-14", "ld.lld") if shutil.which(name)), None)
     if not linker:
@@ -428,7 +436,7 @@ def build(args, work):
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-#         "-DLLVM_ENABLE_LTO=Thin",
+        "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
@@ -438,7 +446,7 @@ def build(args, work):
         raise BuildError("--cmake-args accepts only -DKEY=VALUE definitions; quote values containing spaces.")
     options += extra
     build_dir = work / "build"
-    run(["cmake", "-S", work / "sources/llvm-project/llvm", "-B", build_dir, "-G", "Ninja", *options])
+    run(["cmake", "-S", llvm / "llvm", "-B", build_dir, "-G", "Ninja", *options])
     metadata.update({
         "host_architecture": architecture, "targets": targets, "projects": projects,
         "install_prefix": str(prefix), "build_jobs": jobs, "cmake_options": options,
@@ -453,8 +461,6 @@ def build(args, work):
         return
     run(["cmake", "--build", build_dir, "--target", "distribution", "--parallel", jobs])
     run(["cmake", "--build", build_dir, "--target", "install-distribution-stripped", "--parallel", jobs])
-    # Compiler-rt builtins are produced by the runtimes external project; copy
-    # the archive into the resource directory clang searches at link time.
     builtins_src = build_dir / "lib" / "clang" / "11.0.0" / "lib" / builtin_target / "libclang_rt.builtins-aarch64.a"
     if not builtins_src.is_file():
         candidates = list(build_dir.rglob("libclang_rt.builtins-*.a"))
@@ -480,7 +486,7 @@ def build(args, work):
     notices = prefix / "licenses"
     notices.mkdir(exist_ok=True)
     for directory in ("llvm", "clang", "lld", "compiler-rt"):
-        license_file = work / "sources/llvm-project" / directory / "LICENSE.TXT"
+        license_file = llvm / directory / "LICENSE.TXT"
         if license_file.is_file():
             shutil.copyfile(license_file, notices / f"{directory}-LICENSE.TXT")
     for license_file in (work / "sources/toolchain").glob("MODULE_LICENSE_*"):
