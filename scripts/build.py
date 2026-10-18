@@ -25,9 +25,7 @@ import urllib.request
 TOOLCHAIN_REPO = "aosp-mirror-neo/toolchain_llvm_android"
 LLVM_REPO = "llvm/llvm-project"
 PRESETS = {
-    # clang-r487747c's manifest_10087095.xml (Android 14).
     "r487747c": "8443a75fcd5c80245b194f6510b98a11098fe7fe",
-    # Android's manifest_12833971.xml; pins the patch set as well as the base.
     "r536225": "43ef7af1325b43e13d926d74a89741d4ace5fcf8",
 }
 COMPONENTS = [
@@ -35,6 +33,7 @@ COMPONENTS = [
     "llvm-objcopy", "llvm-objdump", "llvm-profdata", "llvm-readobj",
     "llvm-size", "llvm-strings", "llvm-strip", "llvm-symbolizer",
     "llvm-as", "llvm-dis", "llvm-link", "llc", "opt",
+    "compiler-rt",
 ]
 SMOKE_SOURCE = """typedef unsigned (*callback)(unsigned);
 __attribute__((noinline)) unsigned increment(unsigned x) { return x + 1; }
@@ -47,8 +46,7 @@ void _start(void) {
     for (;;) {}
 }
 """
-# Mirrors AOSP's Soong cfiCflags/cfiLdflags: ThinLTO + cross-DSO CFI + hidden visibility.
-# Clang 11 predates KCFI; this is the classic CFI configuration used by Android.
+# CFI flags used by Android: ThinLTO + cross-DSO CFI + trap.
 CFI_FLAGS = [
     "-flto=thin",
     "-fsanitize=cfi",
@@ -176,7 +174,6 @@ def toolchain_revision(revision, explicit_ref):
         try:
             return resolve_ref(TOOLCHAIN_REPO, ref)
         except urllib.error.HTTPError as error:
-            # GitHub's commits API uses 422 for an unknown branch/ref.
             if error.code not in (404, 422):
                 raise
     raise BuildError("No release branch found. Supply --toolchain-ref explicitly.")
@@ -212,7 +209,6 @@ def source_archive(repo, sha, destination, cache):
     unpack = destination.parent / f".unpack-{destination.name}"
     unpack.mkdir()
     with tarfile.open(archive) as contents:
-        # Python >= 3.12 rejects archives that escape the extraction directory.
         contents.extractall(unpack, filter="data")
     children = list(unpack.iterdir())
     if len(children) != 1 or not children[0].is_dir():
@@ -233,7 +229,6 @@ def load_metadata(work):
 
 
 def _clean_patch_artifacts(llvm):
-    """Remove .rej/.orig files left behind by a failed patch attempt."""
     removed = 0
     for path in llvm.rglob("*"):
         if path.suffix in (".rej", ".orig"):
@@ -250,8 +245,6 @@ def apply_patchset(llvm, patch_directory, patches):
         relative = entry["rel_patch_path"]
         patch = patch_directory / relative
         print(f"Patch {index}/{len(patches)}: {relative}", flush=True)
-        # Match AOSP toolchain-utils' GNU patch invocation, including its
-        # context matching. Some official backports require GNU patch fuzz.
         command = ["patch", "-d", llvm, "-f", "-E", "-p1", "--no-backup-if-mismatch", "-i", patch]
         try:
             run([*command, "--dry-run"])
@@ -263,7 +256,7 @@ def apply_patchset(llvm, patch_directory, patches):
         try:
             run(command)
         except subprocess.CalledProcessError:
-            print(f"WARNING: skipping {relative} (apply failed; source tree may be partially patched)", flush=True)
+            print(f"WARNING: skipping {relative} (apply failed)", flush=True)
             _clean_patch_artifacts(llvm)
             skipped.append({"path": relative, "reason": "apply failed"})
             continue
@@ -292,9 +285,7 @@ def prepare(args, work):
     resolved_revision = effective_revision(revision, version["_svn_revision"])
     llvm_base = args.llvm_ref or version.get("_git_sha")
     if not llvm_base:
-        raise BuildError(
-            "This toolchain revision does not pin an LLVM base; pass --llvm-ref."
-        )
+        raise BuildError("This toolchain revision does not pin an LLVM base; pass --llvm-ref.")
     llvm_sha = resolve_ref(LLVM_REPO, llvm_base)
     llvm = work / "sources" / "llvm-project"
     source_archive(LLVM_REPO, llvm_sha, llvm, work / "downloads")
@@ -302,7 +293,6 @@ def prepare(args, work):
     if not patch_index.is_file():
         raise BuildError("This toolchain revision has no patches/PATCHES.json.")
     patch_data = json.loads(patch_index.read_text())
-    # Older toolchain revisions wrap the list in a "patches" key.
     if isinstance(patch_data, dict):
         patch_data = patch_data.get("patches", [])
     patches = select_patches(patch_data, number)
@@ -392,8 +382,18 @@ def build(args, work):
         f"-DLLVM_USE_LINKER={linker}",
         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
         f"-DLLVM_ENABLE_PROJECTS={';'.join(projects)}",
+        "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
         f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
+        # Cross-compile compiler-rt builtins for the requested target architecture.
+        f"-DLLVM_BUILTIN_TARGETS={'aarch64-unknown-linux-gnu' if 'AArch64' in targets else 'x86_64-unknown-linux-gnu'}",
+        f"-DLLVM_BUILTINS_TARGET={'aarch64' if 'AArch64' in targets else 'x86_64'}",
+        # Build only baremetal builtins; sanitizers/fuzzer/profile need libc headers.
+        "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
+        "-DCOMPILER_RT_BUILD_XRAY=OFF",
+        "-DCOMPILER_RT_BUILD_PROFILE=OFF",
+        "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
+        "-DCOMPILER_RT_BUILD_CRT=OFF",
         f"-DLLVM_PARALLEL_COMPILE_JOBS={jobs}", "-DLLVM_PARALLEL_LINK_JOBS=1",
         "-DLLVM_ENABLE_ASSERTIONS=OFF", "-DLLVM_INCLUDE_TESTS=OFF",
         "-DLLVM_INCLUDE_EXAMPLES=OFF", "-DLLVM_INCLUDE_BENCHMARKS=OFF",
@@ -402,13 +402,10 @@ def build(args, work):
         "-DLLVM_ENABLE_TERMINFO=OFF", "-DLLVM_ENABLE_LIBEDIT=OFF",
         "-DLLVM_ENABLE_LIBXML2=OFF",
         "-DLLVM_ENABLE_ZLIB=OFF", "-DLLVM_ENABLE_ZSTD=OFF",
-        # Ensure portability: do not link against system Z3 or build LLVM dylib.
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-        # Official prebuilts enable LTO for the final stage.
-   #      "-DLLVM_ENABLE_LTO=Thin",
-        # Match AOSP's vendor string format.
+        "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
@@ -422,6 +419,7 @@ def build(args, work):
     metadata.update({
         "host_architecture": architecture, "targets": targets, "projects": projects,
         "install_prefix": str(prefix), "build_jobs": jobs, "cmake_options": options,
+        "runtime_targets": ["aarch64-unknown-linux-gnu"] if "AArch64" in targets else ["x86_64-unknown-linux-gnu"],
         "host_glibc": run(["getconf", "GNU_LIBC_VERSION"], capture=True).strip(),
         "bootstrap_clang": run([compiler, "--version"], capture=True).strip(),
         "cmake_version": run(["cmake", "--version"], capture=True).splitlines()[0],
@@ -444,14 +442,13 @@ def build(args, work):
     (prefix / "validation/kernel-smoke.c").write_text(SMOKE_SOURCE)
     notices = prefix / "licenses"
     notices.mkdir(exist_ok=True)
-    for directory in ("llvm", "clang", "lld"):
+    for directory in ("llvm", "clang", "lld", "compiler-rt"):
         license_file = work / "sources/llvm-project" / directory / "LICENSE.TXT"
         if license_file.is_file():
             shutil.copyfile(license_file, notices / f"{directory}-LICENSE.TXT")
     for license_file in (work / "sources/toolchain").glob("MODULE_LICENSE_*"):
         shutil.copyfile(license_file, notices / license_file.name)
     shutil.copyfile(work / "sources/toolchain/patches/PATCHES.json", prefix / "PATCHES.json")
-    # Clang 11 CFI needs an implicit blacklist file to exist.
     version_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
     version_dir.mkdir(parents=True, exist_ok=True)
     (version_dir / "cfi_blacklist.txt").touch()
@@ -463,6 +460,17 @@ def elf_machine(path):
     if len(header) < 20 or header[:4] != b"\x7fELF":
         raise BuildError(f"Not an ELF executable: {path}")
     return struct.unpack_from("<H" if header[5] == 1 else ">H", header, 18)[0]
+
+
+def compiler_rt_builtins(prefix, triple):
+    """Locate libclang_rt.builtins-<arch>.a for the given target triple."""
+    lib_root = prefix / "lib" / "clang" / "11.0.0" / "lib"
+    arch = triple.split("-")[0]
+    for candidate in lib_root.rglob(f"libclang_rt.builtins-{arch}.a"):
+        if triple in str(candidate):
+            return candidate
+    matches = list(lib_root.rglob(f"libclang_rt.builtins-{arch}.a"))
+    return matches[0] if matches else None
 
 
 def verify(args, work):
@@ -495,6 +503,15 @@ def verify(args, work):
         raise BuildError("Clang did not report the requested AOSP revision.")
     run([prefix / "bin/ld.lld", "--version"])
     run([prefix / "bin/llc", "--version"])
+    # Confirm compiler-rt builtins were installed.
+    builtins = None
+    for triple in metadata.get("runtime_targets", []):
+        builtins = compiler_rt_builtins(prefix, triple)
+        if builtins:
+            print(f"Found compiler-rt builtins: {builtins}", flush=True)
+            break
+    if not builtins:
+        raise BuildError("compiler-rt builtins archive was not installed.")
     checks = work / "checks"
     checks.mkdir(exist_ok=True)
     sample = checks / "kernel-smoke.c"
@@ -524,7 +541,8 @@ def verify(args, work):
     metadata.update({
         "clang_version": actual_version.group(1),
         "minimum_glibc": max(glibc_versions, key=lambda x: tuple(map(int, x.split(".")))) if glibc_versions else None,
-        "verification": "native ELF, dynamic dependencies, selected cross targets, AArch64 ThinLTO/CFI (cross-dso) when enabled",
+        "compiler_rt_builtins": str(builtins) if builtins else None,
+        "verification": "native ELF, dynamic dependencies, compiler-rt builtins present, selected cross targets, AArch64 ThinLTO/CFI (cross-dso) link",
     })
     save_metadata(work, metadata)
     (prefix / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -536,7 +554,6 @@ def compatibility(args, work):
     metadata = load_metadata(work)
     prefix = Path(metadata["install_prefix"])
     docker_platform = {"aarch64": "linux/arm64", "x86_64": "linux/amd64"}[metadata["host_architecture"]]
-    # A stock image also checks that optional host libraries were not required.
     command = "/toolchain/bin/clang --version; /toolchain/bin/ld.lld --version"
     if "AArch64" in metadata["targets"]:
         cfi_args = " ".join(CFI_FLAGS)
@@ -568,7 +585,6 @@ def write_usage_files(prefix, metadata):
 
 
 def relocation(args, work):
-    """Check direct tool use and resource/linker discovery after relocation."""
     metadata = load_metadata(work)
     prefix = Path(metadata["install_prefix"])
     write_usage_files(prefix, metadata)
@@ -616,7 +632,7 @@ def relocation(args, work):
             run([moved / "bin" / name, "--version"], env=environment)
     finally:
         shutil.rmtree(relocation_root)
-    metadata["relocation_verification"] = "passed: moved directory with spaces, clean environment, bundled headers, bundled lld, direct LLVM tools"
+    metadata["relocation_verification"] = "passed: moved directory with spaces, clean environment, bundled headers, bundled lld, compiler-rt, direct LLVM tools"
     save_metadata(work, metadata)
     (prefix / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
