@@ -33,7 +33,7 @@ COMPONENTS = [
     "llvm-objcopy", "llvm-objdump", "llvm-profdata", "llvm-readobj",
     "llvm-size", "llvm-strings", "llvm-strip", "llvm-symbolizer",
     "llvm-as", "llvm-dis", "llvm-link", "llc", "opt",
-    "compiler-rt",
+#     "compiler-rt",
 ]
 SMOKE_SOURCE = """typedef unsigned (*callback)(unsigned);
 __attribute__((noinline)) unsigned increment(unsigned x) { return x + 1; }
@@ -385,9 +385,10 @@ def build(args, work):
         "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
         f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
+        f"-DLLVM_RUNTIME_DISTRIBUTION_COMPONENTS=compiler-rt",
         # Cross-compile compiler-rt builtins for the requested target architecture.
         f"-DLLVM_BUILTIN_TARGETS={'aarch64-unknown-linux-gnu' if 'AArch64' in targets else 'x86_64-unknown-linux-gnu'}",
-        f"-DLLVM_BUILTINS_TARGET={'aarch64' if 'AArch64' in targets else 'x86_64'}",
+#         f"-DLLVM_BUILTINS_TARGET={'aarch64' if 'AArch64' in targets else 'x86_64'}",
         # Build only baremetal builtins; sanitizers/fuzzer/profile need libc headers.
         "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
         "-DCOMPILER_RT_BUILD_XRAY=OFF",
@@ -405,7 +406,7 @@ def build(args, work):
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-        "-DLLVM_ENABLE_LTO=Thin",
+#         "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
