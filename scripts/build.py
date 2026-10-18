@@ -377,10 +377,8 @@ def build(args, work):
         f"-DLLVM_USE_LINKER={linker}",
         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
         f"-DLLVM_ENABLE_PROJECTS={';'.join(projects)}",
-        "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
         f"-DLLVM_BUILTIN_TARGETS={builtin_target}",
-        f"-DLLVM_STRIP={shutil.which('llvm-strip-15') or shutil.which('llvm-strip') or shutil.which('strip')}",
-        f"-DLLVM_RANLIB={shutil.which('llvm-ranlib-15') or shutil.which('llvm-ranlib') or shutil.which('ranlib')}",
+        "-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
         f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
         "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
@@ -423,13 +421,10 @@ def build(args, work):
         print("Configuration validated; compilation was not requested.", flush=True)
         return
     run(["cmake", "--build", build_dir, "--target", "distribution", "--parallel", jobs])
-    # compiler-rt runtime 不在 distribution 中，单独构建。
-    run(["cmake", "--build", build_dir, "--target", "compiler-rt", "--parallel", jobs])
+    run(["cmake", "--build", build_dir, "--target", "builtins", "--parallel", jobs])
     run(["cmake", "--build", build_dir, "--target", "install-distribution-stripped", "--parallel", jobs])
-    # 将 compiler-rt builtins 安装到 prefix 下，供 Clang 自动查找。
     builtins_src = build_dir / "lib" / "clang" / "11.0.0" / "lib" / builtin_target / "libclang_rt.builtins-aarch64.a"
     if not builtins_src.is_file():
-        # 兜底搜索
         candidates = list(build_dir.rglob("libclang_rt.builtins-*.a"))
         builtins_src = next((p for p in candidates if builtin_target in str(p)), None)
     if builtins_src and builtins_src.is_file():
