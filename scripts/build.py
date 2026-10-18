@@ -428,7 +428,7 @@ def build(args, work):
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-        "-DLLVM_ENABLE_LTO=Thin",
+#         "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
