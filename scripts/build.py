@@ -45,13 +45,15 @@ void _start(void) {
     for (;;) {}
 }
 """
+# Trap-mode CFI: no compiler-rt runtime needed at link time.
 CFI_FLAGS = [
     "-flto=thin",
     "-fsanitize=cfi",
-    "-fsanitize-cfi-cross-dso",
     "-fvisibility=hidden",
     "-fsanitize-trap=cfi",
 ]
+# Cross-DSO CFI additionally emits __cfi_slowpath calls; compile-only here.
+CFI_CROSS_DSO_FLAGS = CFI_FLAGS + ["-fsanitize-cfi-cross-dso"]
 
 
 class BuildError(RuntimeError):
@@ -261,42 +263,6 @@ def apply_patchset(llvm, patch_directory, patches):
     return PatchResult(applied, skipped)
 
 
-def patch_runtimes_utils(llvm):
-    """Replace $<TARGET_FILE:llvm-ranlib/llvm-strip> with real host tool paths.
-
-    llvm-ranlib and llvm-strip are add_llvm_tool_symlink targets, so
-    $<TARGET_FILE:...> cannot be evaluated. This substitution is idempotent
-    and covers every CMake file that may reference those expressions.
-    """
-    ranlib = shutil.which("llvm-ranlib-15") or shutil.which("llvm-ranlib") or shutil.which("ranlib")
-    strip = shutil.which("llvm-strip-15") or shutil.which("llvm-strip") or shutil.which("strip")
-    if not ranlib or not strip:
-        print("WARNING: cannot find host ranlib/strip; runtimes patch skipped.", flush=True)
-        return
-    changed = []
-    for relative in (
-        "llvm/cmake/modules/LLVMExternalProjectUtils.cmake",
-        "runtimes/CMakeLists.txt",
-        "runtimes/builtins/CMakeLists.txt",
-        "compiler-rt/cmake/Modules/AddCompilerRT.cmake",
-    ):
-        path = llvm / relative
-        if not path.is_file():
-            continue
-        text = path.read_text()
-        new_text = (text
-                    .replace("$<TARGET_FILE:llvm-ranlib>", ranlib)
-                    .replace("$<TARGET_FILE:llvm-strip>", strip))
-        if new_text != text:
-            path.write_text(new_text)
-            changed.append(relative)
-    if changed:
-        print(f"Patched runtimes tool paths in: {', '.join(changed)}", flush=True)
-        print(f"  ranlib={ranlib}, strip={strip}", flush=True)
-    else:
-        print("WARNING: runtimes patch made no changes; source may already be patched.", flush=True)
-
-
 def prepare(args, work):
     if (work / "source-lock.json").exists():
         raise BuildError("Sources are already prepared. Build them, or use a fresh --work-dir.")
@@ -385,6 +351,60 @@ def automatic_jobs():
     return available
 
 
+def builtin_target_triple(targets):
+    if "AArch64" in targets:
+        return "aarch64-unknown-linux-gnu", "aarch64"
+    if "X86" in targets:
+        return "x86_64-unknown-linux-gnu", "x86_64"
+    return None, None
+
+
+def build_compiler_rt(work, prefix, jobs):
+    """Stage 2: build compiler-rt builtins with the freshly-built clang.
+
+    This bypasses LLVM 11's broken LLVM_ENABLE_RUNTIMES integration (which
+    cannot resolve $<TARGET_FILE:llvm-ranlib> / llvm-strip) and produces the
+    __cfi_slowpath-capable static runtime clang expects at link time.
+    """
+    triple, arch = builtin_target_triple(load_metadata(work).get("targets", []))
+    if not triple:
+        print("WARNING: no AArch64/X86 target selected; skipping compiler-rt builtins.", flush=True)
+        return None
+    cr_build = work / "build-compiler-rt"
+    if cr_build.exists():
+        shutil.rmtree(cr_build)
+    cr_options = [
+        "-G", "Ninja",
+        f"-DCMAKE_C_COMPILER={prefix}/bin/clang",
+        f"-DCMAKE_CXX_COMPILER={prefix}/bin/clang++",
+        f"-DCMAKE_ASM_COMPILER={prefix}/bin/clang",
+        f"-DCMAKE_C_COMPILER_TARGET={triple}",
+        f"-DCMAKE_CXX_COMPILER_TARGET={triple}",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON",
+        "-DCOMPILER_RT_BUILD_BUILTINS=ON",
+        "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
+        "-DCOMPILER_RT_BUILD_XRAY=OFF",
+        "-DCOMPILER_RT_BUILD_PROFILE=OFF",
+        "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
+        "-DCOMPILER_RT_BUILD_CRT=OFF",
+        "-DCOMPILER_RT_INCLUDE_TESTS=OFF",
+        f"-DCOMPILER_RT_INSTALL_PATH={prefix}/lib/clang/11.0.0",
+    ]
+    run(["cmake", "-S", work / "sources/llvm-project/compiler-rt", "-B", cr_build, *cr_options])
+    run(["cmake", "--build", cr_build, "--parallel", jobs])
+    candidates = list(cr_build.rglob(f"libclang_rt.builtins-{arch}.a"))
+    if not candidates:
+        print("WARNING: compiler-rt builtins archive was not produced.", flush=True)
+        return None
+    dst_dir = prefix / "lib" / "clang" / "11.0.0" / "lib" / triple
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / candidates[0].name
+    shutil.copyfile(candidates[0], dst)
+    print(f"Installed compiler-rt builtins: {dst}", flush=True)
+    return str(dst)
+
+
 def build(args, work):
     metadata = load_metadata(work)
     architecture = native_architecture()
@@ -399,9 +419,6 @@ def build(args, work):
         raise BuildError("--jobs must be zero (automatic) or a positive number.")
     jobs = args.jobs or automatic_jobs()
     prefix = work / "install" / f"clang-{metadata['clang_revision']}"
-    llvm = work / "sources" / "llvm-project"
-    # Apply the runtimes tool-path patch every build; idempotent.
-    patch_runtimes_utils(llvm)
     compiler, cxx = compiler_pair()
     linker = next((shutil.which(name) for name in ("ld.lld-22", "ld.lld-21", "ld.lld-20", "ld.lld-19", "ld.lld-18", "ld.lld-17", "ld.lld-16", "ld.lld-15", "ld.lld-14", "ld.lld") if shutil.which(name)), None)
     if not linker:
@@ -409,22 +426,14 @@ def build(args, work):
     components = COMPONENTS.copy()
     if "clang-tools-extra" in projects:
         components += ["clang-tidy", "clangd", "clang-format", "clang-apply-replacements", "clang-scan-deps"]
-    builtin_target = "aarch64-unknown-linux-gnu" if "AArch64" in targets else "x86_64-unknown-linux-gnu"
     options = [
         f"-DCMAKE_INSTALL_PREFIX={prefix}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_CXX_COMPILER={cxx}",
         f"-DLLVM_USE_LINKER={linker}",
         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
         f"-DLLVM_ENABLE_PROJECTS={';'.join(projects)}",
-        "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
-        f"-DLLVM_BUILTIN_TARGETS={builtin_target}",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
         f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
-        "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
-        "-DCOMPILER_RT_BUILD_XRAY=OFF",
-        "-DCOMPILER_RT_BUILD_PROFILE=OFF",
-        "-DCOMPILER_RT_BUILD_LIBFUZZER=OFF",
-        "-DCOMPILER_RT_BUILD_CRT=OFF",
         f"-DLLVM_PARALLEL_COMPILE_JOBS={jobs}", "-DLLVM_PARALLEL_LINK_JOBS=1",
         "-DLLVM_ENABLE_ASSERTIONS=OFF", "-DLLVM_INCLUDE_TESTS=OFF",
         "-DLLVM_INCLUDE_EXAMPLES=OFF", "-DLLVM_INCLUDE_BENCHMARKS=OFF",
@@ -436,7 +445,6 @@ def build(args, work):
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-        "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
@@ -446,11 +454,10 @@ def build(args, work):
         raise BuildError("--cmake-args accepts only -DKEY=VALUE definitions; quote values containing spaces.")
     options += extra
     build_dir = work / "build"
-    run(["cmake", "-S", llvm / "llvm", "-B", build_dir, "-G", "Ninja", *options])
+    run(["cmake", "-S", work / "sources/llvm-project/llvm", "-B", build_dir, "-G", "Ninja", *options])
     metadata.update({
         "host_architecture": architecture, "targets": targets, "projects": projects,
         "install_prefix": str(prefix), "build_jobs": jobs, "cmake_options": options,
-        "builtin_target": builtin_target,
         "host_glibc": run(["getconf", "GNU_LIBC_VERSION"], capture=True).strip(),
         "bootstrap_clang": run([compiler, "--version"], capture=True).strip(),
         "cmake_version": run(["cmake", "--version"], capture=True).splitlines()[0],
@@ -461,18 +468,6 @@ def build(args, work):
         return
     run(["cmake", "--build", build_dir, "--target", "distribution", "--parallel", jobs])
     run(["cmake", "--build", build_dir, "--target", "install-distribution-stripped", "--parallel", jobs])
-    builtins_src = build_dir / "lib" / "clang" / "11.0.0" / "lib" / builtin_target / "libclang_rt.builtins-aarch64.a"
-    if not builtins_src.is_file():
-        candidates = list(build_dir.rglob("libclang_rt.builtins-*.a"))
-        builtins_src = next((p for p in candidates if builtin_target in str(p)), None)
-    if builtins_src and builtins_src.is_file():
-        builtins_dst_dir = prefix / "lib" / "clang" / "11.0.0" / "lib" / builtin_target
-        builtins_dst_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(builtins_src, builtins_dst_dir / builtins_src.name)
-        metadata["compiler_rt_builtins"] = str(builtins_dst_dir / builtins_src.name)
-        print(f"Installed compiler-rt builtins: {metadata['compiler_rt_builtins']}", flush=True)
-    else:
-        print("WARNING: compiler-rt builtins archive was not found in the build tree.", flush=True)
     aliases = {
         "clang++": "clang", "clang-cpp": "clang", "ld.lld": "lld",
         "llvm-readelf": "llvm-readobj", "llvm-addr2line": "llvm-symbolizer",
@@ -486,7 +481,7 @@ def build(args, work):
     notices = prefix / "licenses"
     notices.mkdir(exist_ok=True)
     for directory in ("llvm", "clang", "lld", "compiler-rt"):
-        license_file = llvm / directory / "LICENSE.TXT"
+        license_file = work / "sources/llvm-project" / directory / "LICENSE.TXT"
         if license_file.is_file():
             shutil.copyfile(license_file, notices / f"{directory}-LICENSE.TXT")
     for license_file in (work / "sources/toolchain").glob("MODULE_LICENSE_*"):
@@ -495,6 +490,9 @@ def build(args, work):
     version_dir = prefix / "lib" / "clang" / "11.0.0" / "share"
     version_dir.mkdir(parents=True, exist_ok=True)
     (version_dir / "cfi_blacklist.txt").touch()
+    builtins = build_compiler_rt(work, prefix, jobs)
+    metadata["compiler_rt_builtins"] = builtins
+    save_metadata(work, metadata)
 
 
 def elf_machine(path):
@@ -535,22 +533,24 @@ def verify(args, work):
         raise BuildError("Clang did not report the requested AOSP revision.")
     run([prefix / "bin/ld.lld", "--version"])
     run([prefix / "bin/llc", "--version"])
-    builtin_target = metadata.get("builtin_target")
-    builtins_dir = prefix / "lib" / "clang" / "11.0.0" / "lib" / builtin_target
-    builtins_archive = next(builtins_dir.glob("libclang_rt.builtins-*.a"), None) if builtins_dir.is_dir() else None
-    if not builtins_archive:
-        raise BuildError("compiler-rt builtins archive was not installed.")
-    print(f"Found compiler-rt builtins: {builtins_archive}", flush=True)
+    triple, arch = builtin_target_triple(metadata["targets"])
+    builtins_archive = None
+    if triple:
+        builtins_dir = prefix / "lib" / "clang" / "11.0.0" / "lib" / triple
+        builtins_archive = next(builtins_dir.glob(f"libclang_rt.builtins-{arch}.a"), None) if builtins_dir.is_dir() else None
+        if not builtins_archive:
+            raise BuildError("compiler-rt builtins archive was not installed.")
+        print(f"Found compiler-rt builtins: {builtins_archive}", flush=True)
     checks = work / "checks"
     checks.mkdir(exist_ok=True)
     sample = checks / "kernel-smoke.c"
     sample.write_text(SMOKE_SOURCE)
     targets = {"AArch64": ("aarch64-linux-gnu", 183), "ARM": ("armv7a-linux-gnueabi", 40), "X86": ("x86_64-linux-gnu", 62), "RISCV": ("riscv64-linux-gnu", 243)}
-    for backend, (triple, target_machine) in targets.items():
+    for backend, (cross_triple, target_machine) in targets.items():
         if backend not in metadata["targets"]:
             continue
         output = checks / f"{backend}.o"
-        run([prefix / "bin/clang", f"--target={triple}", "-O2", "-ffreestanding", "-fno-stack-protector", "-c", sample, "-o", output])
+        run([prefix / "bin/clang", f"--target={cross_triple}", "-O2", "-ffreestanding", "-fno-stack-protector", "-c", sample, "-o", output])
         if elf_machine(output) != target_machine:
             raise BuildError(f"Cross compilation for {backend} produced the wrong architecture.")
         run([prefix / "bin/ld.lld", "-r", output, "-o", checks / f"{backend}-linked.o"])
@@ -561,6 +561,9 @@ def verify(args, work):
         run([prefix / "bin/ld.lld", "-e", "_start", bitcode, "-o", checks / "cfi.elf"])
         if elf_machine(checks / "cfi.elf") != 183:
             raise BuildError("ThinLTO/CFI linking failed.")
+        cross_dso = checks / "cfi-cross-dso.o"
+        run([prefix / "bin/clang", "--target=aarch64-linux-gnu", "-O2", "-ffreestanding",
+             "-fno-stack-protector", *CFI_CROSS_DSO_FLAGS, "-c", sample, "-o", cross_dso])
     if "BPF" in metadata["targets"]:
         bpf_source = checks / "bpf.c"
         bpf_source.write_text("int probe(void *ctx) { return ctx != 0; }\n")
@@ -570,8 +573,7 @@ def verify(args, work):
     metadata.update({
         "clang_version": actual_version.group(1),
         "minimum_glibc": max(glibc_versions, key=lambda x: tuple(map(int, x.split(".")))) if glibc_versions else None,
-        "compiler_rt_builtins": str(builtins_archive),
-        "verification": "native ELF, dynamic dependencies, compiler-rt builtins present, selected cross targets, AArch64 ThinLTO/CFI (cross-dso) link",
+        "verification": "native ELF, dynamic dependencies, compiler-rt builtins present, selected cross targets, AArch64 ThinLTO/CFI trap link + cross-DSO compile",
     })
     save_metadata(work, metadata)
     (prefix / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
