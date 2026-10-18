@@ -31,7 +31,7 @@ PRESETS = {
 COMPONENTS = [
     "clang", "clang-resource-headers", "lld", "llvm-ar", "llvm-nm",
     "llvm-objcopy", "llvm-objdump", "llvm-profdata", "llvm-readobj",
-    "llvm-size", "llvm-strings", "llvm-strip", "llvm-symbolizer",
+    "llvm-size", "llvm-strings", "llvm-strip", "llvm-ranlib", "llvm-symbolizer",
     "llvm-as", "llvm-dis", "llvm-link", "llc", "opt",
 ]
 SMOKE_SOURCE = """typedef unsigned (*callback)(unsigned);
@@ -261,6 +261,35 @@ def apply_patchset(llvm, patch_directory, patches):
     return PatchResult(applied, skipped)
 
 
+def patch_runtimes_utils(llvm):
+    """Replace $<TARGET_FILE:llvm-ranlib/llvm-strip> with real host tool paths.
+
+    LLVM 11's runtimes integration references these generator expressions, but
+    llvm-ranlib and llvm-strip are symlink targets (add_llvm_tool_symlink), so
+    $<TARGET_FILE:...> cannot be evaluated. Swap in the host tool paths.
+    """
+    utils = llvm / "llvm/cmake/modules/LLVMExternalProjectUtils.cmake"
+    if not utils.is_file():
+        print("WARNING: LLVMExternalProjectUtils.cmake not found; skipping runtimes patch.", flush=True)
+        return
+    ranlib = shutil.which("llvm-ranlib-15") or shutil.which("llvm-ranlib") or shutil.which("ranlib")
+    strip = shutil.which("llvm-strip-15") or shutil.which("llvm-strip") or shutil.which("strip")
+    text = utils.read_text()
+    changed = False
+    for old, new in (
+        ("$<TARGET_FILE:llvm-ranlib>", ranlib or ""),
+        ("$<TARGET_FILE:llvm-strip>", strip or ""),
+    ):
+        if old in text and new:
+            text = text.replace(old, new)
+            changed = True
+    if changed:
+        utils.write_text(text)
+        print(f"Patched runtimes tool paths: ranlib={ranlib}, strip={strip}", flush=True)
+    else:
+        print("WARNING: runtimes patch made no changes; LLVM 11 may need manual fix.", flush=True)
+
+
 def prepare(args, work):
     if (work / "source-lock.json").exists():
         raise BuildError("Sources are already prepared. Build them, or use a fresh --work-dir.")
@@ -292,6 +321,7 @@ def prepare(args, work):
     patches = select_patches(patch_data, number)
     result = apply_patchset(llvm, toolchain / "patches", patches)
     applied, skipped = list(result), result.skipped
+    patch_runtimes_utils(llvm)
     patch_level = version.get("_patch_level")
     if patch_level is not None and not re.fullmatch(r"[0-9]+", str(patch_level)):
         raise BuildError("Unsupported AOSP patch level.")
@@ -307,6 +337,7 @@ def prepare(args, work):
         "custom_llvm_base": llvm_sha != version.get("_git_sha"),
         "aosp_patch_level": patch_level,
         "patch_application": "AOSP GNU patch: -f -E -p1 --no-backup-if-mismatch (conflicts skipped)",
+        "runtimes_utils_patched": True,
         "patches": applied,
         "skipped_patches": skipped,
     }
@@ -377,8 +408,8 @@ def build(args, work):
         f"-DLLVM_USE_LINKER={linker}",
         "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc",
         f"-DLLVM_ENABLE_PROJECTS={';'.join(projects)}",
+        "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
         f"-DLLVM_BUILTIN_TARGETS={builtin_target}",
-        "-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON",
         f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
         f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
         "-DCOMPILER_RT_BUILD_SANITIZERS=OFF",
@@ -397,7 +428,7 @@ def build(args, work):
         "-DLLVM_ENABLE_Z3_SOLVER=OFF", "-DCLANG_ANALYZER_BUILD_Z3=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF", "-DLLVM_LINK_LLVM_DYLIB=OFF",
         "-DCLANG_LINK_CLANG_DYLIB=OFF",
-#         "-DLLVM_ENABLE_LTO=Thin",
+        "-DLLVM_ENABLE_LTO=Thin",
         f"-DCLANG_VENDOR=Android (6877366 based on {metadata['clang_revision']}) ",
     ]
     if metadata["aosp_patch_level"] is not None:
@@ -421,8 +452,9 @@ def build(args, work):
         print("Configuration validated; compilation was not requested.", flush=True)
         return
     run(["cmake", "--build", build_dir, "--target", "distribution", "--parallel", jobs])
-    run(["cmake", "--build", build_dir, "--target", "builtins", "--parallel", jobs])
     run(["cmake", "--build", build_dir, "--target", "install-distribution-stripped", "--parallel", jobs])
+    # Compiler-rt builtins are produced by the runtimes external project; copy
+    # the archive into the resource directory clang searches at link time.
     builtins_src = build_dir / "lib" / "clang" / "11.0.0" / "lib" / builtin_target / "libclang_rt.builtins-aarch64.a"
     if not builtins_src.is_file():
         candidates = list(build_dir.rglob("libclang_rt.builtins-*.a"))
@@ -431,12 +463,13 @@ def build(args, work):
         builtins_dst_dir = prefix / "lib" / "clang" / "11.0.0" / "lib" / builtin_target
         builtins_dst_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(builtins_src, builtins_dst_dir / builtins_src.name)
-        print(f"Installed compiler-rt builtins: {builtins_dst_dir / builtins_src.name}", flush=True)
+        metadata["compiler_rt_builtins"] = str(builtins_dst_dir / builtins_src.name)
+        print(f"Installed compiler-rt builtins: {metadata['compiler_rt_builtins']}", flush=True)
     else:
         print("WARNING: compiler-rt builtins archive was not found in the build tree.", flush=True)
     aliases = {
         "clang++": "clang", "clang-cpp": "clang", "ld.lld": "lld",
-        "llvm-ranlib": "llvm-ar", "llvm-readelf": "llvm-readobj", "llvm-addr2line": "llvm-symbolizer",
+        "llvm-readelf": "llvm-readobj", "llvm-addr2line": "llvm-symbolizer",
     }
     for alias, target in aliases.items():
         path = prefix / "bin" / alias
@@ -618,11 +651,11 @@ def relocation(args, work):
             if elf_machine(linked) != machine:
                 raise BuildError("Relocated Clang/lld produced the wrong target architecture.")
             break
-        for name in ("clang++", "ld.lld", "llvm-ar"):
+        for name in ("clang++", "ld.lld", "llvm-ar", "llvm-ranlib", "llvm-strip"):
             run([moved / "bin" / name, "--version"], env=environment)
     finally:
         shutil.rmtree(relocation_root)
-    metadata["relocation_verification"] = "passed: moved directory with spaces, clean environment, bundled headers, bundled lld, compiler-rt, direct LLVM tools"
+    metadata["relocation_verification"] = "passed: moved directory with spaces, clean environment, bundled headers, bundled lld, compiler-rt, ranlib/strip, direct LLVM tools"
     save_metadata(work, metadata)
     (prefix / "BUILD_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
